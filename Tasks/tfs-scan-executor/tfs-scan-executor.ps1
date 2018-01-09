@@ -1,109 +1,13 @@
 param()
 
-######################FUNCTIONS######################
-#https://github.com/TotalALM/VSTS-Tasks/blob/master/Tasks/Unzip/task/unzip.ps1
-function UnZip($zipPath, $folderPath) {
-    Add-Type -Assembly "System.IO.Compression.FileSystem" ;
-    [System.IO.Compression.ZipFile]::ExtractToDirectory("$zipPath", "$folderPath") ;
-    
-    Start-Sleep -m 4000
-    
-    If (Test-Path $zipPath){
-        Remove-Item $zipPath
-    }
-}
-#https://github.com/TotalALM/VSTS-Tasks/blob/master/Tasks/Unzip/task/unzip.ps1
-function RemoveZip($zip) { 
-    Start-Sleep -m 4000
-    If (Test-Path $zip){
-        Remove-Item $zip -Recurse -Force
-    }
-}
+Write-Host "BEGINNING NEW TFS SCRIPT !!!!!!!!!!!!!!!!"
+######################LIBRARIES######################
 
-function GetScanStatus($JsonData, $HubSession, $HubScanTimeout) {	
-    #Start timer based on HubScanTimeout. If the scan has not completed in the specified amount of time, exit the script
-    $Timeout = New-Timespan -Minutes $HubScanTimeout
-    $SW = [Diagnostics.Stopwatch]::StartNew()
-	
-    while ($SW.Elapsed -lt $Timeout) {
-		
-        try {
-            $ScanSummaryResponse = Invoke-RestMethod -Uri $JsonData._meta.href -Method Get -WebSession $HubSession
-        }
-        catch {
-            Write-Error ("ERROR: Exception checking scan status")
-            Write-Error -Exception $_.Exception -Message "Exception occured getting scan url."
-            Write-Error ("RESPONSE: {0}" -f $_.Exception.Response)
-            Exit
-        }
-		
-        if ($ScanSummaryResponse.status -eq "COMPLETE") {
-            Return
-        }
-        Else {
-            Start-Sleep -Seconds 3
-            Continue
-        }
-    }
-    Write-Error ("ERROR: Hub Scan has timed out per configuration: {0} minutes" -f $HubScanTimeout)
-    Exit
-}
+Import-Module $PSScriptRoot\Blackduck\Zip.ps1
+Import-Module $PSScriptRoot\Blackduck\ScanStatus.ps1
 
-function CheckHubUrl($HubUrl) {
-    $HTTP_Request = [System.Net.WebRequest]::Create($HubUrl)
-    $HTTP_Response = $HTTP_Request.GetResponse()
-	
-    If ([int]$HTTP_Response.StatusCode -eq 200) { 
-        Write-Host "INFO: Communication with the Hub succeeded." 
-        $HTTP_Response.Close()
-    }
-    Else {
-        Write-Error "ERROR: Communication with the Hub failed. The server may be down, or the Server URL parameter is incorrect."
-        $HTTP_Response.Close()
-        Exit
-    }
-}
+######################SETTINGS#######################
 
-function PhoneHome($HubUrl, $HubVersion, $HubUsername, $HubPassword) {
-    $RegistrationId = ""
-
-    #Establish Session
-    Invoke-RestMethod -Uri ("{0}/j_spring_security_check" -f $HubUrl) -Method Post -Body (@{j_username=$HubUsername;j_password=$HubPassword}) -SessionVariable HubSession
-
-    try {
-        $Registrations = Invoke-RestMethod -Uri ("{0}/api/v1/registrations" -f $HubUrl) -Method Get -WebSession $HubSession
-        $RegistrationId = $Registrations.registrationId
-    }
-    catch {
-        $MD5 = New-Object -TypeName System.Security.Cryptography.MD5CryptoServiceProvider
-        $UTF8 = New-Object -TypeName System.Text.UTF8Encoding
-        $Hash = [System.BitConverter]::ToString($MD5.ComputeHash($UTF8.GetBytes($HubUrl)))
-        $RegistrationId = $Hash.ToLower() -Replace '-', ''
-    }
-
-    $body = [Ordered]@{
-        regId = $RegistrationId
-        source = "Integrations"
-        infoMap = @{
-            blackDuckName="Hub"; 
-            blackDuckVersion=$HubVersion;
-            thirdPartyName="TFS";
-            thirdPartyVersion="1.0";
-            pluginVersion="2.0.0";
-        }
-    }
-
-    $json = $body | ConvertTo-Json
-
-    try {
-        $Collection = Invoke-Webrequest -Uri "https://collect.blackducksoftware.com" -Method Post -Body $json -ContentType "application/json" -TimeoutSec 5
-    }
-    catch {
-        #Do nothing
-    }
-
-}
-#####################################################
 #Utilize TLS 1.2 for this session
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
@@ -147,7 +51,7 @@ if (($HubUrl.Substring($HubUrl.Length-1) -eq "/")) {
 
 #Ensure HubURL is correct, and connectivity can be established. 
 #No point in continuing if we can't connect to the Hub.
-CheckHubUrl $HubUrl
+#CheckHubUrl $HubUrl
 
 #Establish Session
 try {
@@ -157,70 +61,6 @@ catch {
     Write-Error ("ERROR: Could not establish session - Unauthorized")
     Exit
 }
-
-#Get Hub instance version number
-$HubVersion = Invoke-RestMethod -Uri ("{0}/api/v1/current-version" -f $HubUrl) -Method Get -WebSession $HubSession
-Write-Host ("INFO: Black Duck Hub {0}" -f $HubVersion)
-
-#Determine if Hub scan client exists in the Agent home directory. If not, download it from the Hub instance.
-if(!(Test-Path($HubScannerChildLocation))) {
-    Write-Host ("INFO: Hub scan client not found, create folder at: {0}" -f $HubScannerParentLocation)
-    New-Item -ItemType directory -Path $HubScannerParentLocation | Out-Null
-    $WC = New-Object System.Net.WebClient
-    $CliUrl = ("{0}/{1}" -f $HubUrl, $HostedCli)
-    $Filename = [System.IO.Path]::GetFileName($CliUrl)
-    $Output = Join-Path $HubScannerParentLocation $Filename
-    Write-Host ("INFO: Downloading Hub scan client from: {0}" -f $CliUrl)
-    $WC.DownloadFile($CliUrl, $Output)
-	
-    if (Test-Path($Output)) { 
-        Write-Host "INFO: Extracting Hub scan client"
-        UnZip $Output $HubScannerParentLocation
-    }
-    else {
-        Write-Error "ERROR: Error downloading Hub scan client"
-        Exit
-    }
-}
-else {
-	
-    $HubScanner = Get-ChildItem $HubScannerParentLocation | Where-Object {$_.PSIsContainer -eq $true -and $_.Name -match ("scan.cli-{0}" -f $HubVersion)}
-
-    if (($HubScanner).Count -eq 0) {
-
-        Write-Host "INFO: Newer Hub version detected, downloading updated scan client"
-
-        $WC = New-Object System.Net.WebClient
-        $CliUrl = ("{0}/{1}" -f $HubUrl, $HostedCli)
-        $Filename = [System.IO.Path]::GetFileName($CliUrl)
-        $Output = Join-Path $HubScannerParentLocation $Filename
-        Write-Host ("INFO: Downloading Hub scan client from: {0}" -f $CliUrl)
-        $WC.DownloadFile($CliUrl, $Output)
-
-        if (Test-Path($Output)) { 
-            Write-Host "INFO: Extracting Hub scan client"
-            UnZip $Output $HubScannerParentLocation
-        }
-        else {
-            Write-Error "ERROR: Error downloading Hub scan client"
-            Exit
-        }
-    }
-}
-
-if (!(Test-Path($HubScannerLogsLocation))) {
-    Write-Host ("INFO: Create Hub logs folder at: {0}" -f $HubScannerLogsLocation)
-    New-Item -ItemType directory -Path $HubScannerLogsLocation | Out-Null
-}
-
-$BuildLogFolder =[System.IO.Path]::Combine($HubScannerLogsLocation, $env:BUILD_DEFINITIONNAME, $env:BUILD_BUILDNUMBER)
-if (!(Test-Path($BuildLogFolder))) {
-    Write-Host ("INFO: Create build specific Hub logs folder at: {0}" -f $BuildLogFolder)
-    New-Item -ItemType directory -Path $BuildLogFolder | Out-Null
-}
-
-$HubScannerChildLocation = Join-Path $HubScannerParentLocation ("scan.cli-{0}" -f $HubVersion)
-Write-Host ("INFO: Hub scan client found at: {0}" -f $HubScannerChildLocation)
 
 #Get scan target
 if ($HubScanTarget) {
@@ -245,23 +85,39 @@ Write-Host ("INFO: Project Version: {0}" -f $HubRelease)
 #Set BD_HUB_PASSWORD environment variable
 $env:BD_HUB_PASSWORD = $HubPassword
 
-#If a Code Location Name is specified, ensure the Hub is version 3.5.0 or later
-if ([version]$HubVersion -ge [version]"3.5.0" -and $HubCodeLocationName) {
-    Write-Host ("INFO: Code Location Name: {0}" -f $HubCodeLocationName)
-    Start-Process -FilePath ("{0}\bin\{1}" -f $HubScannerChildLocation, $HubScanScript) `
-	-ArgumentList ('-username {0} -scheme {1} -host {2} -port {3} "{4}" -project "{5}" -release "{6}" -verbose -statusWriteDir "{7}" -name "{8}" -exclude /$tf/' -f `
-	$HubUsername, ([System.Uri]$HubUrl).Scheme, ([System.Uri]$HubUrl).Host, ([System.Uri]$HubUrl).Port, $ScanTarget, $HubProjectName, $HubRelease, $BuildLogFolder, $HubCodeLocationName) `
-	-NoNewWindow -Wait -RedirectStandardError (Join-Path $BuildLogFolder $LogOutput)
+#Write Powershell related environment variables
+$Env:DETECT_JAR_PATH = $HubScannerParentLocation
+
+#Create detect argument list
+Write-Host "Creating Detect Arguments"
+Write-Host $ScanTarget.GetType()
+$ScanTarget = $ScanTarget.ToString()
+Write-Host $ScanTarget.GetType()
+$DetectArguments =  @("--detect.source.path", $ScanTarget)
+Write-Host $DetectArguments.GetType()
+
+$JavaArgs = @("-jar", "BLAH")
+Write-Host $JavaArgs.GetType()
+$AllArgs =  $JavaArgs + $DetectArguments
+Write-Host $AllArgs.GetType()
+Write-Host "Running detect: $AllArgs"
+
+$DetectProcess = Start-Process java -ArgumentList $AllArgs -NoNewWindow -PassThru
+
+Invoke-RestMethod https://blackducksoftware.github.io/hub-detect/hub-detect.ps1?$(Get-Random) | Invoke-Expression;
+
+#Download Detect from the Web
+try {
+
+} catch {
+    #Write-Warning ("WARNING: Failed to download the latest detect script from the web. Using the last deployed version.")
+	#Import-Module $PSScriptRoot\Blackduck\Detect.ps1
 }
-else {
-    if ([version]$HubVersion -lt [version]"3.5.0" -and $HubCodeLocationName) {
-        Write-Host ("INFO: Code Location Name requires Hub 3.5.0+")
-    }
-    Start-Process -FilePath ("{0}\bin\{1}" -f $HubScannerChildLocation, $HubScanScript) `
-	-ArgumentList ('-username {0} -scheme {1} -host {2} -port {3} "{4}" -project "{5}" -release "{6}" -verbose -statusWriteDir "{7}" -exclude /$tf/' -f `
-	$HubUsername, ([System.Uri]$HubUrl).Scheme, ([System.Uri]$HubUrl).Host, ([System.Uri]$HubUrl).Port, $ScanTarget, $HubProjectName, $HubRelease, $BuildLogFolder) `
-	-NoNewWindow -Wait -RedirectStandardError (Join-Path $BuildLogFolder $LogOutput)
-}
+
+#Invoke Detect
+Detect @DetectArguments
+
+Exit 
 
 #Get Hub scan status, and based on it, continue or exit
 $status = ((Select-String -Path (Join-Path $BuildLogFolder $LogOutput) -Pattern "ERROR: ") -split ": ")[-1]
