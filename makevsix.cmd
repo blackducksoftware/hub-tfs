@@ -38,7 +38,7 @@ ECHO Creating vsix...
 CALL tfx extension create --manifest-globs vsts-extension-hub-tfs.json
 FOR %%F IN ("*.vsix") DO (
 	SET _VSIX=%%F
-	SET _NEWVSIX=!_VSIX:~-18!
+	set _NEWVSIX=!_VSIX:black-duck-software.=!
 	MOVE /y !_VSIX! !_NEWVSIX! >nul
 )
 IF NOT %ERRORLEVEL%==0 GOTO FAILED
@@ -56,4 +56,5 @@ EXIT /B %ERRORLEVEL%
 
 :FAILED
 ECHO Vsix creation failed
+ECHO %ERRORLEVEL%
 EXIT /B 1
